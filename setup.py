@@ -3,11 +3,11 @@ from setuptools import setup, find_packages
 with open("README.md", "r") as readme_file:
     readme = readme_file.read()
 
-requirements = ["nbformat>=4", "nbconvert>=5", "requests>=2"]
+requirements = ["requests>=2"]
 
 setup(
     name="OEEToolkit",
-    version="0.0.2",
+    version="0.0.5",
     author="Francisco Melendez",
     author_email="fco.melendez.f@gmail.com",
     description="A package to calculate the OEE for Industry 4.0 Assets",
