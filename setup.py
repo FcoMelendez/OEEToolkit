@@ -6,7 +6,7 @@ with open("README.md", "r") as readme_file:
 requirements = ["ipython>=6", "nbformat>=4", "nbconvert>=5", "requests>=2"]
 
 setup(
-    name="notebookc",
+    name="OEEToolkit",
     version="0.0.2",
     author="Jeff Hale",
     author_email="fco.melendez.f@gmail.com",
