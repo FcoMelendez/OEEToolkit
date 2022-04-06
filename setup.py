@@ -7,7 +7,7 @@ requirements = ["ipython>=6", "nbformat>=4", "nbconvert>=5", "requests>=2"]
 
 setup(
     name="notebookc",
-    version="0.0.1",
+    version="0.0.2",
     author="Jeff Hale",
     author_email="fco.melendez.f@gmail.com",
     description="A package to calculate the OEE for Industry 4.0 Assets",
