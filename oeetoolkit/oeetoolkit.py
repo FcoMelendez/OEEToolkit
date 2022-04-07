@@ -1,9 +1,11 @@
 #!/usr/bin/python
 
+from pydoc import resolve
 import sys, getopt
 import logging
 import threading
 import time
+from tkinter import Pack
 import requests
 import json
 from enum import Enum
@@ -33,12 +35,7 @@ class ngsiv2Interface:
     self.broker_ip = ctxBroker_ip
     self.broker_port = ctxBroker_port  
     self.entity_id = entity_id
-    # create attributes
-    # - oeeAvailability
-    # - oeePerformance
-    # - oeeQuality
-    # - oeeValue
-    # - assetPackMLState
+    self.lastAssetState = {}
     self.connect(ctxBroker_ip,ctxBroker_port,entity_id)
   
   def connect(self, broker_ip, broker_port, entity_id_str):
@@ -70,8 +67,24 @@ class ngsiv2Interface:
     json_payload = json.dumps(payload, indent = 2)
     response = requests.request("POST", url, headers=headers, data=json_payload)
     print(response.text)
+  
+  def readAssetState(self):
+    url = "http://"+str(self.broker_ip)+":"+str(self.broker_port)+"/v2/entities/"+str(self.entity_id)+"/attrs/assetPackMLState?metadata=dateModified"
+    state = None
+    payload={}
+    headers = {}
+    response = requests.request("GET", url, headers=headers, data=payload)
+    responseDict = json.loads(response.text)
+    #if self.lastAssetState != {}:
+    #  if self.lastAssetState["metadata"]["dateModified"]["value"]==responseDict["metadata"]["dateModified"]["value"]:
+    #    state = None
+    #  else:
+    #    state = responseDict["value"]
+    #self.lastAssetState=responseDict
+    state = responseDict["value"]
+    return state
 
-  def sendData(self, A,P,Q,OEE):
+  def sendOeeData(self, A,P,Q,OEE):
     id_str = str(self.entity_id)
     url = "http://"+str(self.broker_ip)+":"+str(self.broker_port)+"/v2/entities/"+id_str+"/attrs"
     headers = {'Content-Type': 'application/json'}
@@ -104,19 +117,27 @@ class OeeObject:
     self.Q = float(Q)
     self.lastAssetState = None
     self.samplingRateInSecs = 1
-    self.idealDurationOfExecuteState = 5
+    self.idealDurationOfExecuteStateInSecs = 4
     self.availabilityDurationInSecs = 0
-    self.executeStateTimer = 0 
-    self.goodPartCounter = 0
-    self.totalPartCounter = 0
-    self.totalDurationTimer = 0
+    self.executeStateTimerInSecs = 0 
+    self.goodPartCount = 0
+    self.totalPartCount = 0
+    self.totalDurationTimerInSecs = 1
+    self.anomaliesCount = 0
+    self.anomaliesDurationTimer = 0
+    self.plannedBreaksCount = 0
+    self.plannedBreaksDurationTimerInSecs = 0
+    self.currentPartExecutionTimerInSecs = 0
 
   def setAvailability(self, value):
     self.A = value
+    return self.A
   def setPerformance(self, value):
     self.P = value
+    return self.P
   def setQuality(self, value):
     self.Q = value
+    return self.Q
   def getOEE(self):
     self.OEE = self.A * self.P * self.Q
     print("OEE is ", self.OEE )
@@ -132,97 +153,193 @@ class OeeObject:
   # According to the PackML standard, valid and invalid pairs exist.
   # The following function  includes the valid pairs and determines the impact of each of them in the OEE. 
   # - Event 1  (Continuity): IDLE2IDLE
-  # - Event 2  (Continuity): EXECUTE2EXECUTE
-  # - Event 3  (Continuity): STOPPED2STOPPED
-  # - Event 4  (Continuity): ABORTED2ABORTED
-  # - Event 5  (Transition): IDLE2EXECUTE
-  # - Event 6  (Transition): IDLE2ABORTED
-  # - Event 7  (Transition): EXECUTE2STOPPED
-  # - Event 8  (Transition): EXECUTE2ABORTED
+  # - Event 2  (Transition): IDLE2EXECUTE
+  # - Event 3  (Transition): IDLE2ABORTED
+  # - Event 4  (Transition): IDLE2STOPPED
+  # - Event 5  (Continuity): EXECUTE2EXECUTE
+  # - Event 6  (Transition): EXECUTE2STOPPED
+  # - Event 7  (Transition): EXECUTE2ABORTED
+  # - Event 8  (Continuity): STOPPED2STOPPED
   # - Event 9  (Transition): STOPPED2IDLE
-  # - Event 10 (Transition): ABORTED2STOPPED
+  # - Event 10 (Transition): STOPPED2IABORTED
+  # - Event 11 (Continuity): ABORTED2ABORTED
+  # - Event 12 (Transition): ABORTED2STOPPED
+  #
+  # The function below identifies the event associated to each incoming asset state
+  # and reflects the effects of such events in the OEE algorithm variables
 
-  def onOeeEvent(self, newAssetState):
+  def onOeeEvent(self, newAssetState, timeBetweenStateSamplesInSecs):
+    print("---")
+    print(PackMLStates.IDLE.name)
     
     if self.lastAssetState == PackMLStates.IDLE.name:
       if newAssetState == PackMLStates.IDLE.name:
-        self.availabilityDurationInSecs += self.samplingRateInSecs
+        # IDLE2IDLE Event: The machine is available
+        self.availabilityDurationInSecs += timeBetweenStateSamplesInSecs
       elif newAssetState == PackMLStates.EXECUTE.name:
-        self.availabilityDurationInSecs += self.samplingRateInSecs
-        self.totalPartCounter += 1 
+        # IDLE2EXECUTE The machine is available + The production a new Part starts
+        self.availabilityDurationInSecs += timeBetweenStateSamplesInSecs
+        self.currentPartExecutionTimerInSecs = 0
+      elif newAssetState == PackMLStates.STOPPED.name:
+        # IDLE2STOPPED The machine becomes NOT available due to a planned BREAK
+        self.plannedBreaksCount += 1
       elif newAssetState == PackMLStates.ABORTED.name:
-        self.availabilityDurationInSecs += 0
+        # IDLE2ABORTED The machine becomes NOT available with some anomaly/issue
+        self.anomaliesCount += 1
     
     if self.lastAssetState == PackMLStates.EXECUTE.name:
       if newAssetState == PackMLStates.EXECUTE.name:
-        self.availabilityDurationInSecs += self.samplingRateInSecs
-        self.executeStateTimer += self.samplingRateInSecs
+        # EXECUTE2EXECUTE Event: The machine is available + the execution time of the current part increases
+        self.availabilityDurationInSecs += timeBetweenStateSamplesInSecs
+        self.executeStateTimerInSecs += timeBetweenStateSamplesInSecs
+        self.currentPartExecutionTimerInSecs += timeBetweenStateSamplesInSecs
       elif newAssetState == PackMLStates.STOPPED.name:
-        self.goodPartCounter += 1 
+        # EXECUTE2STOPPED Event: The machine becomes NOT available + a new GOOD part is produced
+        self.goodPartCount += 1
+        self.totalPartCount += 1 
+        self.plannedBreaksCount +=1 
       elif newAssetState == PackMLStates.ABORTED.name:
-        self.availabilityDurationInSecs += 0
-    
+        # EXECUTE2ABORTED Event: The machine becomes NOT available + the current part was a BAD part
+        self.anomaliesCount += 1
+        self.totalPartCount += 1 
+        self.executeStateTimerInSecs -= self.currentPartExecutionTimerInSecs
+
     if self.lastAssetState == PackMLStates.STOPPED.name:
       if newAssetState == PackMLStates.STOPPED.name:
-        self.availabilityDurationInSecs += 0
+        #STOPPED2STOPPED Event: The machine remains NOT available 
+        self.plannedBreaksDurationTimerInSecs += timeBetweenStateSamplesInSecs
       elif newAssetState == PackMLStates.IDLE.name:
-        self.availabilityDurationInSecs += 1
+        #STOPPED2IDLE Event: The machine is available again
+        self.availabilityDurationInSecs += timeBetweenStateSamplesInSecs
+      elif newAssetState == PackMLStates.ABORTED.name:
+        #STOPPED2ABORTED Event: The machine is NOT available + some anomaly/issue happened
+        self.anomaliesCount += 1
     
     if self.lastAssetState == PackMLStates.ABORTED.name:
       if newAssetState == PackMLStates.ABORTED.name:
-        self.availabilityDurationInSecs += 0
+        self.anomaliesDurationTimer += 1
       elif newAssetState == PackMLStates.STOPPED.name:
-        self.availabilityDurationInSecs += 0
+        self.plannedBreaksCount += 1
     
-    self.totalDurationTimer += 1
+    self.lastAssetState = newAssetState
+    self.totalDurationTimerInSecs += timeBetweenStateSamplesInSecs
+
+  # There are multiple ways to calculate OEE subindexes (i.e., Availability, Performance, Quality).
+  # For instance, depending on each business case events like "planned breaks" or "short unavailability periods"
+  # may be considered as Availability losses in one company while a seond company considers them as Performance losses.
+  # The current implementation considers:
+  #
+  # Availability Losses: Every single time unit that the machine is not in IDLE or EXECUTE mode is an Avaliability Loss
+  #                       --> Availability = Sum of IDLE & EXECUTE time periods / Sum of all state periods
+  # Performance Losses: Only the execution time associated to Good Parts is taken into account for Performance losses.
+  #                     · Given an ideal part production ratio in secs per part. The ideal performance is expressed as 
+  #                       --> Ideal Count of Parts = Time dedicated to produced Good Parts / Ideal Part Production Ratio
+  #                     · The actual performance value is then calculated as
+  #                       --> Performance = Actual count of Good Parts / Ideal Count of Parts
+  # Quality Losses: Every transition from IDLE to EXECUTE counts as a new part. Every execution that does not result in 
+  #                 a good part is a Quality loss.
+  #                       --> Quality = Good Parts Produced / Total Parts Tried 
+  #
+  # The functions below calculate A, P, and Q indexes based on the variables of the algorithm developed 
+  # for this OEE Toolkit
+
+  def calculateAvailabilityIndex(self):
+    availability = self.availabilityDurationInSecs / self.totalDurationTimerInSecs
+    print("OEE subindex - Availability")
+    print("  idealAvailabilityDuration (seconds): ", self.totalDurationTimerInSecs)
+    print("  actualAvailabilityDuration (seconds): ", self.availabilityDurationInSecs)
+    print("  AVAILABILITY:",availability)
+    return self.setAvailability(availability)
+  
+  def calculatePerformanceIndex(self):
+    performance = 0
+    referencePerformanceUnit = self.idealDurationOfExecuteStateInSecs
+    referenceProductionTime = self.executeStateTimerInSecs
+    referenceGoodPartCount = referenceProductionTime / referencePerformanceUnit
+    if referenceGoodPartCount>0:
+      performance = self.goodPartCount / referenceGoodPartCount
+    print("OEE subindex - Performance")
+    print("  Ideal Number of Parts: ", referenceGoodPartCount)
+    print("  Actual Number of Parts: ", self.goodPartCount)
+    print("  PERFORMANCE:", performance)
+    return self.setPerformance(performance)
+  
+  def calculateQualityIndex(self):
+    quality = 0
+    if self.totalPartCount>0:  
+      quality = self.goodPartCount / self.totalPartCount
+    print("OEE subindex - Quality")
+    print("  Total Parts: ", self.totalPartCount)
+    print("  Actual Good Parts: ", self.goodPartCount)
+    print("  QUALITY:", quality)
+    return self.setQuality(quality)
 
 
-
-def main_thread_function(name):
+def main_thread_function(name, A, P, Q):
   n = 0
-  while n<10:
-    logging.info("Thread %s: starting", name)
-    time.sleep(2)
-    logging.info("Thread %s: finishing", name)
+  ngsiv2Obj = ngsiv2Interface("localhost", 1026, "myAsset") 
+  oeeObj = OeeObject(A,P,Q)
+  oeeValue = oeeObj.getOEE()
+  print("The OEE is: ", oeeValue)
+  ngsiv2Obj.sendOeeData(A,P,Q,oeeValue)
+  lastStateTimestamp = int(time.time())
+  currentStateTimestamp = int(time.time())
+  while n<100:
+    # Read Asset State
+    currentStateTimestamp = int(time.time())
+    currentState = ngsiv2Obj.readAssetState()
+    if currentState != None:
+      timeBetweenSamplesInSecs = currentStateTimestamp - lastStateTimestamp
+      lastStateTimestamp = currentStateTimestamp
+      logging.info("Thread %s: Asset state is: %s", name, currentState)
+      # Execute on Event Function
+      oeeObj.onOeeEvent(currentState, timeBetweenSamplesInSecs)
+      # calculate OEE subindexes
+      Av = oeeObj.calculateAvailabilityIndex()
+      Pe = oeeObj.calculatePerformanceIndex()
+      Qu = oeeObj.calculateQualityIndex()
+      # Get OEE values
+      OEE = oeeObj.getOEE()
+      ngsiv2Obj.sendOeeData(Av, Pe, Qu, OEE)
+    else:
+      logging.info("Thread %s: Waiting for a new asset state")
+    time.sleep(1)
     n+=1
+  
+  logging.info("Thread %s: Finishing...", name)
 
 def main(argv):
-  ngsiv2Obj = ngsiv2Interface("localhost", 1026, "myAsset")
-  format = "%(asctime)s: %(message)s"
-  logging.basicConfig(format=format, level=logging.INFO, datefmt="%H:%M:%S")
-  logging.info("Main    : before creating thread")
-  x = threading.Thread(target=main_thread_function, args=(1,))
-  logging.info("Main    : before running thread")
-  x.start()
-  logging.info("Main    : wait for the thread to finish")
-  x.join()
-  logging.info("Main    : all done")
-  
-  A = 0
-  P = 0
-  Q = 0
+  a = 0
+  p = 0
+  q = 0
   try:
     opts, args = getopt.getopt(argv,"ha:p:q:",["availability=","performance=","quality="])
   except getopt.GetoptError:
     print ('oeetoolkit.py -a <availability> -p <performance> -q <quality>')
-    sys.exit(2)
+    sys.exit()
   for opt, arg in opts:
     if opt == '-h':
       print ('oeetoolkit.py -a <availability> -p <performance> -q <quality>')
       sys.exit()
     elif opt in ("-a", "--availability"):
-      A = arg
-      print ("A is ", A)
+      a = arg
+      print ("A is ", a)
     elif opt in ("-p", "--performance"):
-      P = arg
-      print ("P is ", P)
+      p = arg
+      print ("P is ", p)
     elif opt in ("-q", "--quality"):
-      Q = arg
-      print ("Q is ", Q)
-  oeeObj = OeeObject(A,P,Q)
-  oeeValue = oeeObj.getOEE()
-  print("The OEE is: ", oeeValue)
-  ngsiv2Obj.sendData(A,P,Q,oeeValue)
+      q = arg
+      print ("Q is ", q)
+
+  format = "%(asctime)s: %(message)s"
+  logging.basicConfig(format=format, level=logging.INFO, datefmt="%H:%M:%S")
+  logging.info("Main    : Creating the main thread of the OEE microservice")
+  x = threading.Thread(target=main_thread_function, args=["OEE", a,p,q])
+  logging.info("Main    : Starting the main thread of the OEE microservice")
+  x.start()
+  logging.info("Main    : waiting for the main thread of the OEE microservice to finish")
+  x.join()
+  logging.info("Main    : all done")
 
 if __name__ == "__main__":
   main(sys.argv[1:])
